@@ -12,6 +12,33 @@ everywhere, and a copy per service is how that stops being true.**
 | `oobi` | validating a URL before fetching it, so a caller cannot aim this service at somewhere it shouldn't reach |
 | `verify` | proving an enrolling key belongs to the identifier claiming it |
 
+## Who imports it
+
+The service-provider services that an [Identity Agent](https://github.com/LF-Decentralized-Trust-labs/identity-bot)
+talks to over open protocols: `sp-mailbox` and `sp-url-relay` today. Any other
+operator implementing those services in Go can import it too.
+
+```sh
+go get github.com/grapeid/sp-common@latest
+```
+
+```go
+import (
+    "github.com/grapeid/sp-common/sign"
+    "github.com/grapeid/sp-common/oobi"
+    "github.com/grapeid/sp-common/verify"
+)
+```
+
+The canonical signing form is the one described in the Identity Agent's ADR-024
+(*KERI Network Participation*): Ed25519 over the JSON body with keys sorted and
+the `signature` field removed. `verify` checks enrolment against the identity's
+key event log, which is how a self-addressing identifier is bound to its keys in
+KERI.
+
+Run the tests with `go test ./...`. There is nothing to configure; it is a
+library.
+
 ## Why these three, specifically
 
 **`sign` fails silently when it drifts.** The canonical form is the exact byte
@@ -61,3 +88,8 @@ The client's copy still lives in the Identity Agent and is not imported from
 here: that repository's Go module has a bare name rather than a fetchable path,
 so nothing outside it can import it. It remains a fourth copy, and the golden
 vectors are the thing standing between it and silent drift.
+
+## Licence
+
+Apache License 2.0 — see `LICENSE`. Contributions require a DCO sign-off; see
+`CONTRIBUTING.md`. To report a vulnerability, see `SECURITY.md`.
