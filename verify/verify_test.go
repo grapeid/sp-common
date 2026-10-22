@@ -6,6 +6,9 @@ import (
 	"strings"
 	"testing"
 
+	"encoding/json"
+
+	"github.com/LF-Decentralized-Trust-labs/identity-bot/identity-agent-core/relayproto"
 	keri "github.com/grapeid/keri-go"
 )
 
@@ -133,8 +136,37 @@ func TestNoLogAndAnOversizedLogAreRefused(t *testing.T) {
 	if r := (KeyLog{}).Verify(id.aid, "", keyB64(t, id.current)); r.Verified {
 		t.Fatal("accepted with no log")
 	}
-	huge := strings.Repeat("A", MaxKELBytes*2)
+	huge := strings.Repeat("A", relayproto.MaxKELBytes*2)
 	if r := (KeyLog{}).Verify(id.aid, huge, keyB64(t, id.current)); r.Verified || !strings.Contains(r.Reason, "larger") {
 		t.Fatalf("an oversized log was not refused for its size: %+v", r)
+	}
+}
+
+// One member of a group identity must not enrol as the group: a log naming two
+// signing keys is refused, even when the key presented is one of them.
+func TestAMemberOfAGroupCannotEnrolAsTheGroup(t *testing.T) {
+	a, _ := keri.GenerateSigner(true)
+	b, _ := keri.GenerateSigner(true)
+	na, _ := keri.GenerateSigner(true)
+	nb, _ := keri.GenerateSigner(true)
+	pa, _ := a.PublicKey()
+	pb, _ := b.PublicKey()
+	npa, _ := na.PublicKey()
+	npb, _ := nb.PublicKey()
+	da, _ := keri.NextDigest(npa)
+	db, _ := keri.NextDigest(npb)
+	ev, err := keri.BuildInception(keri.InceptionInput{Keys: []string{pa, pb}, NextDigests: []string{da, db},
+		Isith: json.RawMessage(`"2"`), Nsith: json.RawMessage(`"2"`), Derivation: "self-addressing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, _ := keri.ParseEvent(ev)
+	signed, err := keri.SignEvent(ev, a, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kel, _ := keri.ExportKEL([][]byte{signed.Message})
+	if r := (KeyLog{}).Verify(parsed.Identifier, base64.RawURLEncoding.EncodeToString(kel), keyB64(t, a)); r.Verified {
+		t.Fatal("one member of a two-key identity enrolled as the identity")
 	}
 }

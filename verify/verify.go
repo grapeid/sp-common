@@ -7,6 +7,7 @@ import (
 	"log"
 	"strings"
 
+	"github.com/LF-Decentralized-Trust-labs/identity-bot/identity-agent-core/relayproto"
 	keri "github.com/grapeid/keri-go"
 )
 
@@ -51,14 +52,10 @@ type Verifier interface {
 	Enabled() bool
 }
 
-// Limits on a presented log. It arrives in a request, so its size is the
-// caller's choice until it is bounded.
-const (
-	MaxKELBytes  = 64 << 10
-	MaxKELEvents = 256
-)
-
-// KeyLog verifies with keri-go, in process.
+// KeyLog verifies with keri-go, in process, through relayproto.CurrentKey: the
+// one answer every service provider uses to "which key speaks for this
+// identifier", with its size and event limits. This package keeps no copy of
+// those rules.
 type KeyLog struct{}
 
 func (KeyLog) Enabled() bool { return true }
@@ -67,45 +64,31 @@ func (KeyLog) Verify(aid, kelB64, publicKeyB64 string) Result {
 	if strings.TrimSpace(kelB64) == "" {
 		return Result{Reason: "a signed key event log is required: without one there is nothing to check this key against"}
 	}
-	if len(kelB64) > MaxKELBytes*4/3+4 {
-		return Result{Reason: fmt.Sprintf("the key event log is larger than %d bytes", MaxKELBytes)}
+	if len(kelB64) > base64.RawURLEncoding.EncodedLen(relayproto.MaxKELBytes)+4 {
+		return Result{Reason: fmt.Sprintf("the key event log is larger than %d bytes", relayproto.MaxKELBytes)}
 	}
 	stream, err := decode(kelB64)
 	if err != nil {
 		return Result{Reason: "the key event log is not base64"}
 	}
-	messages, err := keri.ParseKELStream(stream)
+	current, err := relayproto.CurrentKey(aid, stream)
 	if err != nil {
-		return Result{Reason: "the key event log is not readable: " + err.Error()}
-	}
-	if len(messages) > MaxKELEvents {
-		return Result{Reason: fmt.Sprintf("the key event log has %d events; the limit is %d", len(messages), MaxKELEvents)}
-	}
-	state, err := keri.ValidateSignedKEL(messages)
-	if err != nil {
-		return Result{Reason: "the key event log does not verify: " + err.Error()}
-	}
-	if state.Identifier != aid {
-		// Worth naming precisely: the honest version of this mistake, sending
-		// the wrong log, looks identical to the dishonest one.
-		return Result{Reason: fmt.Sprintf("that key event log is %s's, not %s's", state.Identifier, aid)}
+		return Result{Reason: err.Error()}
 	}
 	presented, err := decode(publicKeyB64)
 	if err != nil || len(presented) != ed25519.PublicKeySize {
 		return Result{Reason: "the public key is not a base64 Ed25519 key"}
 	}
-	for _, k := range state.Keys {
-		raw, err := keri.MatterRaw(keri.CodeEd25519, k, ed25519.PublicKeySize)
-		if err != nil {
-			continue
-		}
-		if ed25519.PublicKey(raw).Equal(ed25519.PublicKey(presented)) {
-			return Result{Verified: true, CurrentKey: k}
-		}
+	if !current.Equal(ed25519.PublicKey(presented)) {
+		// The key is real and the identifier is real; they are not each
+		// other's. Most often a key the identity has since rotated away from.
+		return Result{Reason: "the key presented is not this identity's current signing key"}
 	}
-	// The key is real and the identifier is real; they are not each other's.
-	// Most often a key the identity has since rotated away from.
-	return Result{Reason: "the key presented is not this identity's current signing key"}
+	qb64, err := keri.MatterQB64(keri.CodeEd25519, current)
+	if err != nil {
+		return Result{Reason: err.Error()}
+	}
+	return Result{Verified: true, CurrentKey: qb64}
 }
 
 // Unverified accepts every enrolment without checking.

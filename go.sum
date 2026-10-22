@@ -1,5 +1,5 @@
-github.com/LF-Decentralized-Trust-labs/identity-bot/identity-agent-core/relayproto v0.0.0-20261021235759-8584054dd939 h1:P04q1nu1cHMcmHzA4CH4hHR1r7NrzF3l6rZV8FKEb1c=
-github.com/LF-Decentralized-Trust-labs/identity-bot/identity-agent-core/relayproto v0.0.0-20261021235759-8584054dd939/go.mod h1:SyJvK6o5aYufFS56KL5hJBBXjJZSGnjMppgifgazsIw=
+github.com/LF-Decentralized-Trust-labs/identity-bot/identity-agent-core/relayproto v0.0.0-20261022001345-7d7ac19ad512 h1:stoK/45+HYcEW9KkclGwrwD3CBFADx9WgHvLZ4jLLSE=
+github.com/LF-Decentralized-Trust-labs/identity-bot/identity-agent-core/relayproto v0.0.0-20261022001345-7d7ac19ad512/go.mod h1:SyJvK6o5aYufFS56KL5hJBBXjJZSGnjMppgifgazsIw=
 github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aNNg=
 github.com/gorilla/websocket v1.5.3/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=
 github.com/grapeid/keri-go v0.1.5 h1:/HCHgbQbJ+HP/cHIe0DyxLXMnBC8gK3Z2sz0rseltGA=

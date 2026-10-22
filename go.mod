@@ -3,7 +3,7 @@ module github.com/grapeid/sp-common
 go 1.25.0
 
 require (
-	github.com/LF-Decentralized-Trust-labs/identity-bot/identity-agent-core/relayproto v0.0.0-20261021235759-8584054dd939
+	github.com/LF-Decentralized-Trust-labs/identity-bot/identity-agent-core/relayproto v0.0.0-20261022001345-7d7ac19ad512
 	github.com/grapeid/keri-go v0.1.5
 )
 
