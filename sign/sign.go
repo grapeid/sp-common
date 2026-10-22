@@ -1,35 +1,37 @@
 package sign
 
 import (
-	"bytes"
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"sort"
+
+	"github.com/LF-Decentralized-Trust-labs/identity-bot/identity-agent-core/relayproto"
 )
 
-// Proving a request came from the AID it claims.
+// Proving a request came from the identifier it claims.
 //
-// The scheme is the one the URL relay uses, and deliberately so: an agent
-// talking to a relay and a mailbox should not have to sign two different ways,
-// and an operator running both should not have to implement two verifiers.
+// Every service-provider request is signed over one form, set by the Identity
+// Agent's ADR-049 and implemented once, in relayproto.CanonicalBody: the
+// request's fields as a JSON object, every field a string of printable ASCII,
+// keys sorted, no whitespace, no HTML escaping, the signature field left out.
+// This package does not keep its own copy of that form. A second copy is how
+// three implementations came to disagree about an ampersand.
 
-// CanonicalBody returns deterministic JSON bytes for signing: the body with its
-// signature field removed, keys sorted.
-//
-// Sorting is what makes this reproducible. Go's map iteration is deliberately
-// unordered, so signing a marshalled map without sorting produces a different
-// byte string on each run and verification fails at random — which is worse
-// than failing consistently, because it looks like an intermittent network
-// problem.
+// CanonicalBody returns the bytes a request is signed over. v is a struct or a
+// map whose fields are all strings; a number, a list or a nested object is
+// refused rather than signed in a spelling another implementation would not
+// reproduce, so a request carries counts and lists as strings.
 func CanonicalBody(v interface{}) ([]byte, error) {
-	m, err := toMap(v)
+	raw, err := json.Marshal(v)
 	if err != nil {
 		return nil, err
 	}
-	delete(m, "signature")
-	return marshalSorted(m)
+	var fields map[string]interface{}
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, fmt.Errorf("a signed request is a JSON object: %w", err)
+	}
+	return relayproto.CanonicalBody(fields)
 }
 
 // VerifyEd25519 checks a signature over the canonical body.
@@ -56,10 +58,9 @@ func VerifyEd25519(publicKeyB64, signatureB64 string, body []byte) error {
 
 // decode accepts both standard and url-safe base64, padded or not.
 //
-// Not laxness for its own sake. The agent side encodes signatures url-safe and
-// unpadded while keys arrive standard-padded, and an operator that accepted
-// only one spelling would reject valid requests for a reason nobody could see
-// from the error message.
+// Signatures are written base64url without padding (ADR-049). Keys arrive in
+// whichever spelling a client's library produced, and refusing a valid key for
+// its spelling gives an error nobody can act on.
 func decode(s string) ([]byte, error) {
 	for _, enc := range []*base64.Encoding{
 		base64.StdEncoding,
@@ -72,72 +73,4 @@ func decode(s string) ([]byte, error) {
 		}
 	}
 	return nil, fmt.Errorf("not base64")
-}
-
-func toMap(v interface{}) (map[string]interface{}, error) {
-	raw, err := json.Marshal(v)
-	if err != nil {
-		return nil, err
-	}
-	var m map[string]interface{}
-	if err := json.Unmarshal(raw, &m); err != nil {
-		return nil, err
-	}
-	return m, nil
-}
-
-// marshalSorted writes an object with its keys in order, recursing into nested
-// objects so a nested map cannot reintroduce the randomness this exists to
-// remove.
-func marshalSorted(m map[string]interface{}) ([]byte, error) {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	var buf bytes.Buffer
-	buf.WriteByte('{')
-	for i, k := range keys {
-		if i > 0 {
-			buf.WriteByte(',')
-		}
-		kb, err := json.Marshal(k)
-		if err != nil {
-			return nil, err
-		}
-		buf.Write(kb)
-		buf.WriteByte(':')
-		vb, err := marshalValue(m[k])
-		if err != nil {
-			return nil, err
-		}
-		buf.Write(vb)
-	}
-	buf.WriteByte('}')
-	return buf.Bytes(), nil
-}
-
-func marshalValue(v interface{}) ([]byte, error) {
-	switch t := v.(type) {
-	case map[string]interface{}:
-		return marshalSorted(t)
-	case []interface{}:
-		var buf bytes.Buffer
-		buf.WriteByte('[')
-		for i, item := range t {
-			if i > 0 {
-				buf.WriteByte(',')
-			}
-			ib, err := marshalValue(item)
-			if err != nil {
-				return nil, err
-			}
-			buf.Write(ib)
-		}
-		buf.WriteByte(']')
-		return buf.Bytes(), nil
-	default:
-		return json.Marshal(v)
-	}
 }

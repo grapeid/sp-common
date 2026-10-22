@@ -1,215 +1,135 @@
 package verify
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
+	"crypto/ed25519"
+	"encoding/base64"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
-	"time"
+	"strings"
 
-	"github.com/grapeid/sp-common/oobi"
+	keri "github.com/grapeid/keri-go"
 )
 
-// Proving that a key belongs to the AID enrolling with it.
+// Proving that a key belongs to the identifier enrolling with it.
 //
-// Enrollment arrives with an AID and a public key, and a signature made by that
-// key over the request. That proves the caller holds the key they are
-// presenting. It proves nothing about whose AID it is — anybody can generate a
-// key, sign with it, and name somebody else's identifier.
+// Enrolment arrives with an identifier and a public key, and a signature made
+// by that key over the request. That proves the caller holds the key. It proves
+// nothing about whose identifier it is: anybody can make a key, sign with it,
+// and name somebody else's identifier.
 //
-// The binding lives in the identity's own key event log. A self-addressing AID
-// is the Blake3 SAID of its inception event, so an inception containing these
-// keys either derives this AID or it does not; producing one that derives
-// somebody else's means finding a hash collision.
+// The binding lives in the identifier's own key event log. A self-addressing
+// identifier is the digest of its inception event, so a log either derives
+// this identifier or it does not, and the key in force after its last event is
+// the only one entitled to speak for it.
 //
-// This service does NOT do that check itself. Getting KERI validation right
-// means exact serialisation, exact hash inputs, and the same dummied fields the
-// reference implementation uses — reimplemented per service, that is four
-// chances to differ subtly and fail in ways nobody can debug. So the KEL goes
-// to a KERI service that already does it, and this package's job is to fetch
-// honestly, ask, and refuse clearly.
+// So the enrolling party sends its signed key event log, and this package
+// checks it in this process with keri-go: the same engine the Identity Agent
+// runs, so the check cannot drift from the one that made the log. Nothing is
+// fetched from an address the caller chose, and no other service is asked.
 //
 // How bad it is to skip this depends on what enrolling grants, and that differs
-// by service. Where enrollment only reserves a name, the worst case is squatting
-// — the real owner is locked out, but nothing of theirs is exposed. Where later
-// operations are authenticated against the key recorded at enrollment, it is a
-// full takeover of that identity's presence on the service. Each service should
-// say which of those it is, in its own README, rather than leaving somebody to
-// work it out from this package.
+// by service. Each service says which in its own README.
 
 // Result is what verification concluded.
 type Result struct {
-	// Verified is true only when the KEL was checked AND bound to the AID AND
-	// the presented key is the identity's current one.
+	// Verified is true only when the log verified, derives this identifier,
+	// and names the presented key as its current one.
 	Verified bool
-	// CurrentKey is the signing key the KEL says is active. Empty unless
-	// verified — an unverified chain's idea of the current key is exactly the
-	// thing not to trust.
+	// CurrentKey is the current signing key, qb64. Empty unless verified.
 	CurrentKey string
 	// Reason explains a refusal in terms somebody can act on.
 	Reason string
 }
 
-// Verifier binds an enrolling key to its AID.
+// Verifier binds an enrolling key to its identifier.
 type Verifier interface {
-	// Verify reports whether publicKeyB64 is the current signing key of aid,
-	// according to the KEL published at oobiURL.
-	Verify(ctx context.Context, aid, oobiURL, publicKeyB64 string) Result
-	// Enabled reports whether this verifier actually checks anything, so the
-	// service can say so at startup rather than appearing to be strict.
+	// Verify reports whether publicKeyB64 is aid's current signing key,
+	// according to the signed key event log kelB64 (a CESR stream, base64url).
+	Verify(aid, kelB64, publicKeyB64 string) Result
+	// Enabled reports whether this verifier checks anything, so a service can
+	// say so at start-up rather than appearing to be strict.
 	Enabled() bool
 }
 
-// Unverified accepts every enrollment without checking.
+// Limits on a presented log. It arrives in a request, so its size is the
+// caller's choice until it is bounded.
+const (
+	MaxKELBytes  = 64 << 10
+	MaxKELEvents = 256
+)
+
+// KeyLog verifies with keri-go, in process.
+type KeyLog struct{}
+
+func (KeyLog) Enabled() bool { return true }
+
+func (KeyLog) Verify(aid, kelB64, publicKeyB64 string) Result {
+	if strings.TrimSpace(kelB64) == "" {
+		return Result{Reason: "a signed key event log is required: without one there is nothing to check this key against"}
+	}
+	if len(kelB64) > MaxKELBytes*4/3+4 {
+		return Result{Reason: fmt.Sprintf("the key event log is larger than %d bytes", MaxKELBytes)}
+	}
+	stream, err := decode(kelB64)
+	if err != nil {
+		return Result{Reason: "the key event log is not base64"}
+	}
+	messages, err := keri.ParseKELStream(stream)
+	if err != nil {
+		return Result{Reason: "the key event log is not readable: " + err.Error()}
+	}
+	if len(messages) > MaxKELEvents {
+		return Result{Reason: fmt.Sprintf("the key event log has %d events; the limit is %d", len(messages), MaxKELEvents)}
+	}
+	state, err := keri.ValidateSignedKEL(messages)
+	if err != nil {
+		return Result{Reason: "the key event log does not verify: " + err.Error()}
+	}
+	if state.Identifier != aid {
+		// Worth naming precisely: the honest version of this mistake, sending
+		// the wrong log, looks identical to the dishonest one.
+		return Result{Reason: fmt.Sprintf("that key event log is %s's, not %s's", state.Identifier, aid)}
+	}
+	presented, err := decode(publicKeyB64)
+	if err != nil || len(presented) != ed25519.PublicKeySize {
+		return Result{Reason: "the public key is not a base64 Ed25519 key"}
+	}
+	for _, k := range state.Keys {
+		raw, err := keri.MatterRaw(keri.CodeEd25519, k, ed25519.PublicKeySize)
+		if err != nil {
+			continue
+		}
+		if ed25519.PublicKey(raw).Equal(ed25519.PublicKey(presented)) {
+			return Result{Verified: true, CurrentKey: k}
+		}
+	}
+	// The key is real and the identifier is real; they are not each other's.
+	// Most often a key the identity has since rotated away from.
+	return Result{Reason: "the key presented is not this identity's current signing key"}
+}
+
+// Unverified accepts every enrolment without checking.
 //
-// Exists so that development and testing do not require a KERI service, and is
-// deliberately loud: a service running with this is open to AID squatting and
-// should say so on every enrollment rather than only in a README nobody rereads.
+// For development and tests only, and loud about it: a service running with
+// this is open to identifier squatting and says so on every enrolment.
 type Unverified struct{}
 
 func (Unverified) Enabled() bool { return false }
 
-func (Unverified) Verify(_ context.Context, aid, _, _ string) Result {
-	log.Printf("[verify] WARNING: enrolling %s without checking the key belongs to it — "+
-		"this operator is open to AID squatting", aid)
+func (Unverified) Verify(aid, _, _ string) Result {
+	log.Printf("[verify] WARNING: enrolling %q without checking the key belongs to it; "+
+		"this operator is open to identifier squatting", aid)
 	return Result{Verified: false, Reason: "verification is disabled on this operator"}
 }
 
-// KeriService verifies by resolving the OOBI and asking a KERI service whether
-// the KEL is genuine and bound to the AID.
-type KeriService struct {
-	// BaseURL is the KERI service that performs validation.
-	BaseURL string
-	Client  *http.Client
-}
-
-func NewKeriService(baseURL string) *KeriService {
-	return &KeriService{
-		BaseURL: baseURL,
-		// Bounded on purpose. Resolution reaches an address the caller chose,
-		// so a slow or hanging endpoint is a way to tie up this service.
-		Client: &http.Client{Timeout: 15 * time.Second},
-	}
-}
-
-func (k *KeriService) Enabled() bool { return k.BaseURL != "" }
-
-func (k *KeriService) Verify(ctx context.Context, aid, oobiURL, publicKeyB64 string) Result {
-	if oobiURL == "" {
-		return Result{Reason: "an OOBI is required: without one there is no KEL to check this key against"}
-	}
-	if err := oobi.Validate(oobiURL); err != nil {
-		return Result{Reason: "OOBI address refused: " + err.Error()}
-	}
-
-	events, resolvedAID, err := k.fetchKEL(ctx, oobiURL)
-	if err != nil {
-		return Result{Reason: "could not read the KEL: " + err.Error()}
-	}
-	if resolvedAID != "" && resolvedAID != aid {
-		// The OOBI is somebody else's. Worth naming precisely, because the
-		// honest version of this mistake — pasting the wrong link — looks
-		// identical to the dishonest one.
-		return Result{Reason: fmt.Sprintf(
-			"that OOBI publishes %s, not %s", resolvedAID, aid)}
-	}
-	if len(events) == 0 {
-		return Result{Reason: "that OOBI published no key events"}
-	}
-
-	validated, err := k.validate(ctx, aid, events)
-	if err != nil {
-		return Result{Reason: "KEL validation failed: " + err.Error()}
-	}
-	if !validated.KelVerified {
-		reason := "the KEL did not verify"
-		if len(validated.ValidationErrors) > 0 {
-			reason += ": " + validated.ValidationErrors[0]
+func decode(s string) ([]byte, error) {
+	s = strings.TrimSpace(s)
+	for _, enc := range []*base64.Encoding{
+		base64.RawURLEncoding, base64.URLEncoding, base64.StdEncoding, base64.RawStdEncoding,
+	} {
+		if raw, err := enc.DecodeString(s); err == nil {
+			return raw, nil
 		}
-		return Result{Reason: reason}
 	}
-	if validated.CurrentPublicKey == "" {
-		return Result{Reason: "the KEL verified but reported no current key"}
-	}
-	if validated.CurrentPublicKey != publicKeyB64 {
-		// The key is real and the AID is real; they are just not each other's.
-		// Most often this is an agent enrolling with a key it has since
-		// rotated away from.
-		return Result{Reason: "the key presented is not this identity's current signing key"}
-	}
-	return Result{Verified: true, CurrentKey: validated.CurrentPublicKey}
-}
-
-// fetchKEL resolves an OOBI and returns its key events.
-func (k *KeriService) fetchKEL(ctx context.Context, oobiURL string) ([]map[string]interface{}, string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, oobiURL, nil)
-	if err != nil {
-		return nil, "", err
-	}
-	resp, err := k.Client.Do(req)
-	if err != nil {
-		return nil, "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, "", fmt.Errorf("endpoint returned %d", resp.StatusCode)
-	}
-	// Capped: this reads from an address the caller chose, and an endless body
-	// is the cheapest denial of service there is.
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil {
-		return nil, "", err
-	}
-
-	var payload struct {
-		AID string                   `json:"aid"`
-		KEL []map[string]interface{} `json:"kel"`
-	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, "", fmt.Errorf("response was not a readable OOBI document")
-	}
-	return payload.KEL, payload.AID, nil
-}
-
-type validationResult struct {
-	KelVerified      bool     `json:"kel_verified"`
-	EventsValidated  int      `json:"events_validated"`
-	CurrentPublicKey string   `json:"current_public_key"`
-	ValidationErrors []string `json:"validation_errors"`
-}
-
-// validate asks the KERI service whether this KEL is genuine and belongs to
-// this AID.
-//
-// The AID is sent because that is the question that matters. A KEL that is
-// merely self-consistent proves only that somebody built a chain; what makes it
-// this identity's chain is that its inception derives this AID.
-func (k *KeriService) validate(ctx context.Context, aid string, events []map[string]interface{}) (*validationResult, error) {
-	body, err := json.Marshal(map[string]interface{}{"aid": aid, "events": events})
-	if err != nil {
-		return nil, err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		k.BaseURL+"/validate-kel", bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := k.Client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("validation service returned %d", resp.StatusCode)
-	}
-	var out validationResult
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, fmt.Errorf("validation response was unreadable: %w", err)
-	}
-	return &out, nil
+	return nil, fmt.Errorf("not base64")
 }

@@ -30,11 +30,13 @@ import (
 )
 ```
 
-The canonical signing form is the one described in the Identity Agent's ADR-024
-(*KERI Network Participation*): Ed25519 over the JSON body with keys sorted and
-the `signature` field removed. `verify` checks enrolment against the identity's
-key event log, which is how a self-addressing identifier is bound to its keys in
-KERI.
+The signing form is the one set by the Identity Agent's ADR-049 (*One signing
+form for every service-provider request*): Ed25519 over the request's fields as
+a JSON object, every field a string of printable ASCII, keys sorted, no
+whitespace, no HTML escaping, the `signature` field left out. `sign` does not
+implement it; it calls `relayproto.CanonicalBody`, the Identity Agent's own
+function. `verify` checks an enrolling key against the identity's signed key
+event log, in process, with keri-go.
 
 Run the tests with `go test ./...`. There is nothing to configure; it is a
 library.
@@ -47,15 +49,15 @@ space, a key order, how a number is written — every signature fails, and what 
 person sees is `signature invalid` with nothing pointing at why. It's a
 miserable thing to diagnose because both sides look correct in isolation.
 
-`sign/golden_test.go` pins the output bytes rather than merely testing for
-self-consistency. **A change to those strings is a wire change, not a
-refactor** — it breaks every deployed signer at once and should have to be
-argued for rather than slipping through green tests.
+So there is one implementation, not a copy per service. `sign` calls
+`relayproto.CanonicalBody`, and `sign/golden_test.go` holds it to the published
+vectors (`relayproto.SigningVectors()`, the same file the Identity Agent's tests
+use). **A change to those bytes is a wire change, not a refactor**, and it fails
+in the Identity Agent's repository first.
 
-One thing worth knowing if this is ever reimplemented in another language: Go's
-`encoding/json` escapes `<`, `>` and `&` as `<`, `>` and `&` by
-default. Most JSON writers don't. The golden vectors pin the real behaviour, not
-the behaviour that looks right.
+Counts and lists travel as strings (`"limit": "50"`, `"message_ids": "m-1 m-2"`).
+A number, a list or a nested object is refused rather than signed, because JSON
+writers disagree about how to spell them.
 
 **`oobi` fails silently when it drifts too, but in the other direction.** A rule
 tightened in one service and not another is a gap nobody notices, because
@@ -68,26 +70,22 @@ is, because anybody can generate a key, sign with it, and name somebody else's
 identifier. Only the identity's own key event log settles that, and asking it
 correctly is subtle enough that it should be done once.
 
-## What is deliberately not here
+## How `verify` checks a key
 
-**KERI validation itself.** `verify` fetches a key event log and asks a KERI
-service whether it is genuine and belongs to the identifier claimed. Getting
-that right means exact serialisation, exact hash inputs, and the same blanked
-fields the reference implementation uses; reimplemented per service, that is
-several chances to differ subtly and fail in ways nobody can debug.
+The enrolling party sends its signed key event log as a CESR stream (base64url).
+`verify.KeyLog` parses and validates it with keri-go, the engine the Identity
+Agent itself runs, then checks that the log derives the identifier claimed and
+names the presented key as its current one. Nothing is fetched from an address
+the caller chose, and no other service is asked. The log is bounded
+(`MaxKELBytes`, `MaxKELEvents`).
 
 ## History
 
-These packages started as copies in `sp-url-relay` and `sp-mailbox`. Before
-merging them, all three implementations of the canonical form — including the
-client's, in the Identity Agent itself — were compared byte for byte on nested
-objects, arrays, escaping and number formatting. **They agreed.** So this is
-consolidation of something already correct, not a repair.
-
-The client's copy still lives in the Identity Agent and is not imported from
-here: that repository's Go module has a bare name rather than a fetchable path,
-so nothing outside it can import it. It remains a fourth copy, and the golden
-vectors are the thing standing between it and silent drift.
+These packages started as copies in `sp-url-relay` and `sp-mailbox`. Three
+implementations of the signing form then disagreed about HTML escaping and
+about numbers and lists. They are now one: the Identity Agent's
+`relayproto.CanonicalBody`, which this module imports. Key logs used to be sent
+to a separate KERI service for validation; they are now validated in process.
 
 ## Licence
 
